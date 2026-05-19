@@ -1,0 +1,20 @@
+[package]
+name = "compose-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "compose_gen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+indexmap.workspace = true
+# regress is here so typify-generated `compose_types` can link against
+# the same `@compose_crates//:regress` we re-export via Bazel; the
+# generated Rust references `::regress::Regex` by absolute path.
+regress.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true

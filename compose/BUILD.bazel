@@ -1,0 +1,74 @@
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load("@rules_jsonschema//starlark:defs.bzl", "jsonschema_starlark_codegen")
+load("@rules_jsonschema//util:write_source_files.bzl", "write_source_files")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "defs.bzl",
+    "compose_rules.bzl",
+])
+
+bzl_library(
+    name = "defs_bzl",
+    srcs = ["defs.bzl"],
+    deps = [":compose_rules"],
+)
+
+# The schema-derived typed rules live here as a committed `.bzl`; the
+# codegen + diff_test below re-derive them on every build to catch
+# drift between the committed file and the canonical schema.
+bzl_library(
+    name = "compose_rules",
+    srcs = ["compose_rules.bzl"],
+    deps = ["@rules_jsonschema//runtime:helpers"],
+)
+
+# Regenerate the typed `docker_compose_service` / `_volume` /
+# `_network` Bazel rules from the canonical compose-spec schema.
+# Output is committed at compose/compose_rules.bzl; the diff_test
+# below gates that the committed file matches what the codegen
+# produces.
+jsonschema_starlark_codegen(
+    name = "compose_rules_gen",
+    schema = "@compose_spec//file:compose-spec.json",
+    kinds = [
+        (
+            "service",
+            "#/definitions/service",
+            "docker_compose_service",
+            "ComposeServiceInfo",
+        ),
+        (
+            "volume",
+            "#/definitions/volume",
+            "docker_compose_volume",
+            "ComposeVolumeInfo",
+        ),
+        (
+            "network",
+            "#/definitions/network",
+            "docker_compose_network",
+            "ComposeNetworkInfo",
+        ),
+    ],
+)
+
+diff_test(
+    name = "compose_rules_up_to_date",
+    file1 = "compose_rules.bzl",
+    file2 = ":compose_rules_gen",
+)
+
+# `bazel run //compose:update_compose_rules` copies the freshly-
+# regenerated `compose_rules.bzl` over the committed copy. Run after
+# bumping the compose-spec pin in compose/private/extensions.bzl or
+# after rules_jsonschema's codegen changes what the typed rule
+# surface looks like.
+write_source_files(
+    name = "update_compose_rules",
+    files = {
+        "compose_rules.bzl": ":compose_rules_gen",
+    },
+)

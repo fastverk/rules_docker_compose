@@ -1,0 +1,112 @@
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load(
+    "@rules_docker_compose//compose:defs.bzl",
+    "docker_compose",
+    "docker_compose_down",
+    "docker_compose_network",
+    "docker_compose_oci_image_ref",
+    "docker_compose_service",
+    "docker_compose_up",
+    "docker_compose_volume",
+)
+
+# A two-service stack (nginx + redis) using one named volume and one
+# private network. Demonstrates that services, volumes, and networks
+# can live anywhere in the graph: a real repo might put each in its
+# own package and aggregate via the parent `docker_compose` rule.
+#
+# The typed attrs on docker_compose_service / _volume / _network come
+# from rules_jsonschema's `jsonschema_starlark_codegen` applied to the
+# canonical compose-spec schema — see compose/private/compose_rules.bzl.
+# That's why fields like `healthcheck` (in healthcheck_test below) need
+# JSON-encoded values: they map to nested compose-spec objects rather
+# than the few primitives that flatten into typed Bazel attrs.
+
+docker_compose_network(
+    name = "appnet",
+    driver = "bridge",
+)
+
+docker_compose_volume(name = "cache")
+
+docker_compose_service(
+    name = "web",
+    image = "nginx:1.27",
+    ports = ["8080:80"],
+    networks = ["appnet"],
+    depends_on = ["redis"],
+    restart = "unless-stopped",
+    environment = {
+        "NGINX_HOST": "example.local",
+    },
+)
+
+docker_compose_service(
+    name = "redis",
+    image = "redis:7",
+    networks = ["appnet"],
+    volumes = ["cache:/data"],
+    healthcheck = json.encode({
+        "test": ["CMD", "redis-cli", "ping"],
+        "interval": "10s",
+        "retries": 3,
+    }),
+)
+
+# Demonstrates the OCI path: a separate target resolves the layout's
+# digest at build time and contributes a `ComposeServiceImageRefInfo`
+# that overrides `image:` on the named service. In a real repo
+# `oci_image` would point at a `@rules_oci//oci:defs.bzl%oci_image` or
+# `oci_pull` target; the fixture below keeps the test hermetic.
+filegroup(
+    name = "fake_alpine_layout",
+    srcs = glob(["fake_oci_layout/**"]),
+)
+
+docker_compose_service(
+    name = "worker",
+    # image left blank — supplied at build time by :worker_image_ref.
+    command = ["echo", "hello from worker"],
+    networks = ["appnet"],
+)
+
+docker_compose_oci_image_ref(
+    name = "worker_image_ref",
+    service_name = "worker",
+    oci_image = ":fake_alpine_layout",
+    oci_repo = "ghcr.io/fastverk/example-worker",
+)
+
+docker_compose(
+    name = "stack",
+    project_name = "smoke",
+    deps = [
+        ":appnet",
+        ":cache",
+        ":redis",
+        ":web",
+        ":worker",
+        ":worker_image_ref",
+    ],
+    out = "compose.yaml",
+)
+
+docker_compose_up(
+    name = "stack.up",
+    project = ":stack",
+)
+
+docker_compose_down(
+    name = "stack.down",
+    project = ":stack",
+)
+
+# Pins the entire end-to-end output. Refresh the committed
+# `expected.yaml` after intentional rule changes with:
+#   bazel build //examples/smoke:stack
+#   cp bazel-bin/examples/smoke/compose.yaml examples/smoke/expected.yaml
+diff_test(
+    name = "stack_yaml_up_to_date",
+    file1 = "expected.yaml",
+    file2 = ":stack",
+)

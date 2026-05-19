@@ -1,0 +1,9 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["extensions.bzl"])
+
+# The canonical compose-spec schema is no longer vendored here — it's
+# fetched by the `compose_spec_extension` module extension declared in
+# extensions.bzl and reachable at `@compose_spec//file:compose-spec.json`.
+# Bumping the spec is a sha256 + commit edit in extensions.bzl, not a
+# 1900-line schema commit.

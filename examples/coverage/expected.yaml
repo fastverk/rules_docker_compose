@@ -1,0 +1,74 @@
+name: coverage
+networks:
+  external_net:
+    external: true
+    name: shared_public
+  internal:
+    attachable: true
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: covnet0
+    internal: true
+    labels:
+      tier: internal
+services:
+  api:
+    build:
+      args:
+        BUILD_VERSION: 1.2.3
+        GIT_SHA: abc123
+      context: ./api
+      dockerfile: Dockerfile.api
+      target: runtime
+    cap_add:
+    - NET_ADMIN
+    - SYS_TIME
+    command:
+    - ./bin/api --listen :8080
+    entrypoint:
+    - /bin/sh
+    - -c
+    env_file:
+    - .env
+    - .env.local
+    environment:
+      LOG_LEVEL: info
+    healthcheck:
+      interval: 30s
+      retries: 5
+      start_period: 20s
+      test:
+      - CMD-SHELL
+      - curl -fsS http://localhost:8080/healthz || exit 1
+      timeout: 5s
+    hostname: api-host
+    init: true
+    labels:
+      traefik.enable: 'true'
+      traefik.http.routers.api.rule: Host(`api.example.com`)
+    networks:
+    - internal
+    - external_net
+    profiles:
+    - dev
+    - prod
+    shm_size: 256m
+    stop_grace_period: 1m30s
+    sysctls:
+      net.core.somaxconn: '1024'
+    user: 1000:1000
+    volumes:
+    - shared:/srv/shared
+    working_dir: /srv/api
+volumes:
+  ext:
+    external: true
+  shared:
+    driver: local
+    driver_opts:
+      device: /var/lib/cov/shared
+      o: bind
+      type: none
+    labels:
+      backup: nightly
+    name: cov_shared

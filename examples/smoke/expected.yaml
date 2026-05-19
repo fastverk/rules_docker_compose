@@ -1,0 +1,38 @@
+name: smoke
+networks:
+  appnet:
+    driver: bridge
+services:
+  redis:
+    healthcheck:
+      interval: 10s
+      retries: 3
+      test:
+      - CMD
+      - redis-cli
+      - ping
+    image: redis:7
+    networks:
+    - appnet
+    volumes:
+    - cache:/data
+  web:
+    depends_on:
+    - redis
+    environment:
+      NGINX_HOST: example.local
+    image: nginx:1.27
+    networks:
+    - appnet
+    ports:
+    - 8080:80
+    restart: unless-stopped
+  worker:
+    command:
+    - echo
+    - hello from worker
+    image: ghcr.io/fastverk/example-worker@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    networks:
+    - appnet
+volumes:
+  cache: {}

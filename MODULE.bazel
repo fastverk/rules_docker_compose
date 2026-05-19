@@ -1,0 +1,48 @@
+module(
+    name = "rules_docker_compose",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+
+# rules_jsonschema generates typed Rust bindings from compose-spec.json
+# at build time. Those bindings are the schema's canonical Rust model —
+# the compose-gen Rust binary deserializes per-service JSON shards
+# into them, exhaustively covering the spec (drift caught at typify
+# codegen time, not via a hand-mirrored allowlist).
+bazel_dep(name = "rules_jsonschema", version = "0.1.0")
+
+bazel_dep(name = "rules_rust", version = "0.70.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.95.0"],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
+crate.from_cargo(
+    name = "compose_crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = [
+        "//:Cargo.toml",
+        "//compose/private/compose_gen:Cargo.toml",
+    ],
+)
+use_repo(crate, "compose_crates")
+
+# Pinned fetch of the canonical compose-spec JSON Schema. Upstream
+# `compose-spec/compose-spec` is a stable separate repo; we pin to a
+# specific commit + sha256 so the schema is reproducible without
+# re-vendoring 1900 lines into PRs. Bumping the spec is two lines:
+# new commit SHA + new sha256. The codegen + diff_test cascade catches
+# whatever changed.
+compose_spec = use_extension("//compose/private:extensions.bzl", "compose_spec_extension")
+use_repo(compose_spec, "compose_spec")
+
+# Dev-only: smoke example wiring + stardoc.
+bazel_dep(name = "rules_shell", version = "0.6.1", dev_dependency = True)
+bazel_dep(name = "stardoc", version = "0.7.2", dev_dependency = True)

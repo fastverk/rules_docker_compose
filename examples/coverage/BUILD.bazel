@@ -1,0 +1,112 @@
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load(
+    "@rules_docker_compose//compose:defs.bzl",
+    "docker_compose",
+    "docker_compose_network",
+    "docker_compose_service",
+    "docker_compose_volume",
+)
+
+# Exercises rule attrs the smoke example doesn't touch. Post-v0.2
+# everything compose-spec accepts is reachable through the typed
+# rules — `build`, `healthcheck`, `deploy` and similar nested objects
+# are JSON-encoded string attrs (the Rust shard reader parses them
+# into typify-generated structs).
+
+docker_compose_network(
+    name = "internal",
+    driver = "bridge",
+    driver_opts = {"com.docker.network.bridge.name": "covnet0"},
+    internal = True,
+    attachable = True,
+    labels = {"tier": "internal"},
+)
+
+docker_compose_network(
+    name = "external_net",
+    external = True,
+    name_override = "shared_public",
+)
+
+docker_compose_volume(
+    name = "shared",
+    driver = "local",
+    driver_opts = {
+        "type": "none",
+        "device": "/var/lib/cov/shared",
+        "o": "bind",
+    },
+    labels = {"backup": "nightly"},
+    name_override = "cov_shared",
+)
+
+docker_compose_volume(
+    name = "ext",
+    external = True,
+)
+
+docker_compose_service(
+    name = "api",
+    build = json.encode({
+        "context": "./api",
+        "dockerfile": "Dockerfile.api",
+        "target": "runtime",
+        "args": {
+            "BUILD_VERSION": "1.2.3",
+            "GIT_SHA": "abc123",
+        },
+    }),
+    entrypoint = ["/bin/sh", "-c"],
+    command = ["./bin/api --listen :8080"],
+    environment = {"LOG_LEVEL": "info"},
+    env_file = [".env", ".env.local"],
+    working_dir = "/srv/api",
+    user = "1000:1000",
+    hostname = "api-host",
+    labels = {
+        "traefik.enable": "true",
+        "traefik.http.routers.api.rule": "Host(`api.example.com`)",
+    },
+    profiles = ["dev", "prod"],
+    # Networks/volumes are addressed by their *Starlark name* (which
+    # becomes the top-level compose key), not by their `name_override`
+    # — the override is the runtime resource name, not the lookup key.
+    networks = [
+        "internal",
+        "external_net",
+    ],
+    volumes = ["shared:/srv/shared"],
+    healthcheck = json.encode({
+        "test": ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"],
+        "interval": "30s",
+        "timeout": "5s",
+        "retries": 5,
+        "start_period": "20s",
+    }),
+    # These used to require `extra_config`; with v0.2 codegen they're
+    # first-class typed Bazel attrs derived from the spec.
+    init = True,
+    shm_size = "256m",
+    stop_grace_period = "1m30s",
+    cap_add = ["NET_ADMIN", "SYS_TIME"],
+    sysctls = {"net.core.somaxconn": "1024"},
+)
+
+docker_compose(
+    name = "stack",
+    project_name = "coverage",
+    deps = [
+        ":api",
+        ":ext",
+        ":external_net",
+        ":internal",
+        ":shared",
+    ],
+    out = "compose.yaml",
+)
+
+diff_test(
+    name = "stack_yaml_up_to_date",
+    file1 = "expected.yaml",
+    file2 = ":stack",
+)

@@ -1,0 +1,39 @@
+load("@compose_crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_jsonschema//rust:defs.bzl", "jsonschema_rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+# Typed bindings derived directly from the compose-spec schema. This
+# is what makes the schema the single source of truth: every field
+# the spec accepts is reachable as a typed Rust struct/enum field,
+# and decoding rejects keys the spec doesn't declare.
+jsonschema_rust_library(
+    name = "compose_types",
+    schema = "@compose_spec//file:compose-spec.json",
+    # Thread our own crate repo's serde/serde_json/regress through the
+    # generated library so the Service / Volume / Network trait impls
+    # live in the same compile unit as compose_gen's own serde uses.
+    # See @rules_jsonschema//rust:defs.bzl for the rationale.
+    serde = "@compose_crates//:serde",
+    serde_json = "@compose_crates//:serde_json",
+    regress = "@compose_crates//:regress",
+)
+
+rust_binary(
+    name = "compose_gen",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    edition = "2021",
+    deps = all_crate_deps() + [":compose_types"],
+)
+
+# Unit tests live inline in main.rs under `#[cfg(test)] mod tests`.
+# Running them as a separate target via `crate = ":compose_gen"` is
+# the rules_rust idiom for binary-crate tests.
+rust_test(
+    name = "compose_gen_test",
+    crate = ":compose_gen",
+)
