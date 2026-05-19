@@ -323,6 +323,11 @@ def _docker_compose_service_impl(ctx):
     item_name = ctx.attr.service_name or ctx.label.name
 
     # Long-tail compose-spec attrs flow through `compose_extra` (JSON dict).
+    # Merge semantics (not naive overwrite):
+    #   - list-valued keys (volumes, ports, command, …) → append extra to payload
+    #   - dict-valued keys (environment, labels, …) → merge dicts (extra wins on collision)
+    #   - scalar keys → extra wins
+    # Lets a service supplement, not replace, what the hot-path attrs emit.
     extra = json.decode(ctx.attr.compose_extra) if ctx.attr.compose_extra else {}
 
     # Hot-path payload — only non-empty fields end up in the shard
@@ -352,8 +357,17 @@ def _docker_compose_service_impl(ctx):
         "stdin_open": ctx.attr.stdin_open if ctx.attr.stdin_open else None,
         "tty": ctx.attr.tty if ctx.attr.tty else None,
     }
-    # Merge compose_extra over the hot-path payload (extra wins on collision).
-    payload.update(extra)
+    # Smart-merge compose_extra into the payload (see semantics in the
+    # compose_extra section above).
+    for k, v in extra.items():
+        if k in payload and type(payload[k]) == "list" and type(v) == "list":
+            payload[k] = payload[k] + v
+        elif k in payload and type(payload[k]) == "dict" and type(v) == "dict":
+            merged = dict(payload[k])
+            merged.update(v)
+            payload[k] = merged
+        else:
+            payload[k] = v
     # Drop empty values; the typify-generated Service struct uses
     # `#[serde(skip_serializing_if = "Option::is_none")]` and a present
     # empty list emits a sequence rather than getting elided.
