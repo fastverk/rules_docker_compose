@@ -1,0 +1,22 @@
+configs:
+  prometheus:
+    file: ./examples/configs_secrets/prometheus.yml
+name: configs_secrets
+networks:
+  appnet:
+    driver: bridge
+secrets:
+  api_key:
+    file: ./examples/configs_secrets/api_key.txt
+  session_key:
+    environment: SESSION_KEY
+services:
+  app:
+    configs:
+    - prometheus
+    image: nginx:1.27
+    networks:
+    - appnet
+    secrets:
+    - api_key
+    - session_key

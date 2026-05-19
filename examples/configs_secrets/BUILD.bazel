@@ -1,0 +1,68 @@
+load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
+load(
+    "@rules_docker_compose//compose:defs.bzl",
+    "docker_compose",
+    "docker_compose_config",
+    "docker_compose_network",
+    "docker_compose_secret",
+    "docker_compose_service",
+)
+
+# Demonstrates the v0.2.0 top-level `configs:` + `secrets:` rules. Both
+# replace the previous workaround of bind-mounting config files via the
+# per-service `volumes:` block; compose-spec's `configs:` semantics
+# (immutable, project-scoped, mountable into multiple services from a
+# single source) are now first-class.
+
+docker_compose_network(name = "appnet", driver = "bridge")
+
+# Top-level config — file-backed. Referenced by `app` via the
+# schema-derived `configs = ["prometheus"]` list.
+docker_compose_config(
+    name = "prometheus",
+    src = "prometheus.yml",
+)
+
+# Top-level secret — file-backed. Referenced by `app` via `secrets`.
+docker_compose_secret(
+    name = "api_key",
+    src = "api_key.txt",
+)
+
+# Top-level secret — environment-backed. Demonstrates the alternative
+# source path; compose reads the env var's value at runtime.
+docker_compose_secret(
+    name = "session_key",
+    environment = "SESSION_KEY",
+)
+
+docker_compose_service(
+    name = "app",
+    image = "nginx:1.27",
+    configs = ["prometheus"],
+    secrets = [
+        "api_key",
+        "session_key",
+    ],
+    networks = ["appnet"],
+)
+
+docker_compose(
+    name = "stack",
+    project_name = "configs_secrets",
+    out = "compose.yaml",
+    deps = [
+        ":api_key",
+        ":app",
+        ":appnet",
+        ":prometheus",
+        ":session_key",
+    ],
+)
+
+# Pin the rendered output so intentional rule changes show up in PR review.
+diff_test(
+    name = "stack_yaml_up_to_date",
+    file1 = "expected.yaml",
+    file2 = ":stack",
+)

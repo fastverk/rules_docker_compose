@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 
-use compose_types::{Network, Service, Volume};
+use compose_types::{Config, Network, Secret, Service, Volume};
 
 // --- entry point ----------------------------------------------------
 
@@ -70,6 +70,8 @@ Usage:
     --service NAME=PATH       (repeated) service shard JSON
     --volume  NAME=PATH       (repeated) volume shard JSON
     --network NAME=PATH       (repeated) network shard JSON
+    --config  NAME=PATH       (repeated) top-level config shard JSON
+    --secret  NAME=PATH       (repeated) top-level secret shard JSON
     --service-image NAME=PATH (repeated) override service image with
                               file contents (trimmed)
 
@@ -88,6 +90,8 @@ struct ProjectArgs {
     services: Vec<(String, PathBuf)>,
     volumes: Vec<(String, PathBuf)>,
     networks: Vec<(String, PathBuf)>,
+    configs: Vec<(String, PathBuf)>,
+    secrets: Vec<(String, PathBuf)>,
     service_images: Vec<(String, PathBuf)>,
 }
 
@@ -107,6 +111,12 @@ fn parse_project(argv: &[String]) -> Result<ProjectArgs> {
             "--network" => out
                 .networks
                 .push(split_kv(it.next().context("--network requires name=path")?)?),
+            "--config" => out
+                .configs
+                .push(split_kv(it.next().context("--config requires name=path")?)?),
+            "--secret" => out
+                .secrets
+                .push(split_kv(it.next().context("--secret requires name=path")?)?),
             "--service-image" => out
                 .service_images
                 .push(split_kv(it.next().context("--service-image requires name=path")?)?),
@@ -125,12 +135,16 @@ fn run_project(argv: Vec<String>) -> Result<()> {
     }
     let volumes = decode_shards::<Volume>(&args.volumes, "volume")?;
     let networks = decode_shards::<Network>(&args.networks, "network")?;
+    let configs = decode_shards::<Config>(&args.configs, "config")?;
+    let secrets = decode_shards::<Secret>(&args.secrets, "secret")?;
 
     let project = Project {
         name: args.name.as_deref(),
         services: &services,
         volumes: &volumes,
         networks: &networks,
+        configs: &configs,
+        secrets: &secrets,
     };
     let yaml = render_project(&project)?;
 
@@ -156,6 +170,10 @@ struct Project<'a> {
     volumes: &'a BTreeMap<String, Volume>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     networks: &'a BTreeMap<String, Network>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    configs: &'a BTreeMap<String, Config>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    secrets: &'a BTreeMap<String, Secret>,
 }
 
 /// Serialise a `Project` to canonical YAML. typify mirrors HashMap
@@ -506,11 +524,15 @@ mod tests {
         );
         let volumes = BTreeMap::new();
         let networks = BTreeMap::new();
+        let configs = BTreeMap::new();
+        let secrets = BTreeMap::new();
         let project = Project {
             name: Some("demo"),
             services: &services,
             volumes: &volumes,
             networks: &networks,
+            configs: &configs,
+            secrets: &secrets,
         };
         let yaml = render_project(&project).unwrap();
         // Top-level fields appear and services come out sorted.
