@@ -2,3 +2,6 @@ bazel-*
 .bazelrc.user
 .DS_Store
 target/
+.claude/
+MODULE.bazel.lock
+
