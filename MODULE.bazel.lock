@@ -393,7 +393,7 @@
     "//compose/private:extensions.bzl%compose_spec_extension": {
       "general": {
         "bzlTransitiveDigest": "E2rqC3dwK9T3YTnJ/hXhD84C5sJyRQRkcf6BwzeUKQc=",
-        "usagesDigest": "djhgNALMY0ohumf21fats9pY2RP7BtbO8sd66/KR0zQ=",
+        "usagesDigest": "Li6m6oNIxTCSuJGMMmt9zmHg84rFgsYwh18BecjZTnQ=",
         "recordedInputs": [
           "REPO_MAPPING:,bazel_tools bazel_tools"
         ],
@@ -669,7 +669,7 @@
     "@@rules_rust+//crate_universe:extension.bzl%crate": {
       "general": {
         "bzlTransitiveDigest": "zE8yHvXMtDUiPQ+Cyq39u73tk8hC5YAlSh9RfjXXPjs=",
-        "usagesDigest": "UvDKDa4bXrAHBNe/4VEQ4let7DK6YoE1vTOPiOH51eg=",
+        "usagesDigest": "P53fvYnOzwv3JPb1dHSMO3cwXK5anZFtSRWKi9FR+CI=",
         "recordedInputs": [
           "ENV:CARGO_BAZEL_DEBUG \\0",
           "ENV:CARGO_BAZEL_GENERATOR_SHA256 \\0",
