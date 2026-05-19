@@ -59,6 +59,23 @@ ComposeServiceImageRefInfo = provider(
     },
 )
 
+ComposeTransitiveInfo = provider(
+    doc = "Bundled depsets of every compose shard reachable through the " +
+          "label-typed attrs of a `docker_compose_service` graph. Populated " +
+          "by `_compose_transitive_aspect`; consumed by the `docker_compose` " +
+          "aggregator so root-only `deps` lists discover transitive volumes / " +
+          "networks / image-refs / configs / secrets automatically.",
+    fields = {
+        "services": "depset of ComposeServiceInfo.",
+        "image_refs": "depset of ComposeServiceImageRefInfo.",
+        "volumes": "depset of ComposeVolumeInfo.",
+        "networks": "depset of ComposeNetworkInfo.",
+        "configs": "depset of ComposeConfigInfo.",
+        "secrets": "depset of ComposeSecretInfo.",
+        "runfiles_files": "depset of File for bind-mount sources + env files.",
+    },
+)
+
 ComposeConfigInfo = provider(
     doc = "A top-level config (compose-spec `configs:` entry). Shard JSON matches the compose-spec config schema.",
     fields = {
@@ -585,68 +602,159 @@ def _collect_shards(deps):
     configs = {}
     secrets = {}
     extra_runfiles = []
+
+    # Gather everything reachable through the transitive aspect first
+    # (root services list root-only deps; the aspect walks the rest).
+    aspect_services = []
+    aspect_image_refs = []
+    aspect_volumes = []
+    aspect_networks = []
+    aspect_configs = []
+    aspect_secrets = []
+    aspect_runfiles_files = []
     for d in deps:
-        # A target can contribute multiple kinds (e.g. a future façade
-        # rule that emits a service shard + an inline image ref). Walk
-        # every provider rather than using elif.
-        matched = False
-        if ComposeServiceInfo in d:
-            info = d[ComposeServiceInfo]
-            if info.service_name in services:
-                fail("duplicate service '{}' contributed by {}".format(info.service_name, d.label))
-            services[info.service_name] = info.json
-            matched = True
-        if ComposeServiceImageRefInfo in d:
-            info = d[ComposeServiceImageRefInfo]
-            if info.service_name in image_refs:
-                fail("duplicate image-ref for service '{}' contributed by {}".format(info.service_name, d.label))
-            image_refs[info.service_name] = info.file
-            matched = True
-        if ComposeVolumeInfo in d:
-            info = d[ComposeVolumeInfo]
-            if info.volume_name in volumes:
-                fail("duplicate volume '{}' contributed by {}".format(info.volume_name, d.label))
-            volumes[info.volume_name] = info.json
-            matched = True
-        if ComposeNetworkInfo in d:
-            info = d[ComposeNetworkInfo]
-            if info.network_name in networks:
-                fail("duplicate network '{}' contributed by {}".format(info.network_name, d.label))
-            networks[info.network_name] = info.json
-            matched = True
-        if ComposeConfigInfo in d:
-            info = d[ComposeConfigInfo]
-            if info.config_name in configs:
-                fail("duplicate config '{}' contributed by {}".format(info.config_name, d.label))
-            configs[info.config_name] = info.json
-            matched = True
-        if ComposeSecretInfo in d:
-            info = d[ComposeSecretInfo]
-            if info.secret_name in secrets:
-                fail("duplicate secret '{}' contributed by {}".format(info.secret_name, d.label))
-            secrets[info.secret_name] = info.json
-            matched = True
-        if not matched:
-            fail("dep {} does not provide a Compose{{Service,Volume,Network,Config,Secret,ServiceImageRef}}Info".format(d.label))
-        # Carry forward any source files the dep contributed via its
-        # DefaultInfo runfiles (e.g. docker_compose_config's src file).
-        # `docker_compose_up`'s runner script needs them in runfiles so
-        # the bind-mount path resolves at `docker compose up` time.
-        if DefaultInfo in d:
-            di = d[DefaultInfo]
-            if di.default_runfiles:
-                extra_runfiles.append(di.default_runfiles)
+        if ComposeTransitiveInfo in d:
+            t = d[ComposeTransitiveInfo]
+            aspect_services.extend(t.services.to_list())
+            aspect_image_refs.extend(t.image_refs.to_list())
+            aspect_volumes.extend(t.volumes.to_list())
+            aspect_networks.extend(t.networks.to_list())
+            aspect_configs.extend(t.configs.to_list())
+            aspect_secrets.extend(t.secrets.to_list())
+            aspect_runfiles_files.extend(t.runfiles_files.to_list())
+
+    def _add(d, key, value, kind):
+        if key in d and d[key] != value:
+            fail("duplicate {} '{}' contributed multiple times with different shards".format(kind, key))
+        d[key] = value
+
+    for info in aspect_services:
+        _add(services, info.service_name, info.json, "service")
+    for info in aspect_image_refs:
+        _add(image_refs, info.service_name, info.file, "image-ref")
+    for info in aspect_volumes:
+        _add(volumes, info.volume_name, info.json, "volume")
+    for info in aspect_networks:
+        _add(networks, info.network_name, info.json, "network")
+    for info in aspect_configs:
+        _add(configs, info.config_name, info.json, "config")
+    for info in aspect_secrets:
+        _add(secrets, info.secret_name, info.json, "secret")
 
     # Image-ref targeting a non-existent service is almost certainly a
     # rename-by-the-other-half bug — flag it explicitly.
     for svc_name in image_refs:
         if svc_name not in services:
-            fail("ComposeServiceImageRefInfo targets service '{}' but no docker_compose_service with that name is in deps".format(svc_name))
+            fail("ComposeServiceImageRefInfo targets service '{}' but no docker_compose_service with that name is reachable".format(svc_name))
 
-    return services, image_refs, volumes, networks, configs, secrets, extra_runfiles
+    return services, image_refs, volumes, networks, configs, secrets, aspect_runfiles_files
+
+# --- _compose_transitive_aspect --------------------------------------
+#
+# Walks `deps`/`deps_healthy`/`deps_completed`/`networks`/`configs`/
+# `secrets`/`named_volume_mounts` on every docker_compose_service in the
+# graph and bundles the discovered Compose*Info providers into a single
+# ComposeTransitiveInfo on each visited target. The aggregator reads
+# the top-level ComposeTransitiveInfo to build the full shard set
+# without requiring every label to be listed in `deps` directly.
+#
+# Targets that don't have these attrs (docker_compose_volume,
+# docker_compose_network, etc.) still get an aspect run — they just
+# contribute their own provider and don't propagate further.
+
+def _bundle_transitive(ts):
+    """Return seven lists of `transitive=` depsets (one per shard category
+    plus runfiles_files) from a list of visited targets that may carry
+    ComposeTransitiveInfo. Entries that aren't Bazel Targets (e.g. string
+    elements from a raw rule's `configs`/`secrets`/`networks` string_list)
+    are silently skipped."""
+    services = []
+    image_refs = []
+    volumes = []
+    networks = []
+    configs = []
+    secrets = []
+    runfiles_files = []
+    for t in ts:
+        if type(t) != "Target":
+            continue
+        if ComposeTransitiveInfo in t:
+            info = t[ComposeTransitiveInfo]
+            services.append(info.services)
+            image_refs.append(info.image_refs)
+            volumes.append(info.volumes)
+            networks.append(info.networks)
+            configs.append(info.configs)
+            secrets.append(info.secrets)
+            runfiles_files.append(info.runfiles_files)
+    return services, image_refs, volumes, networks, configs, secrets, runfiles_files
+
+def _compose_transitive_aspect_impl(target, ctx):
+    # Direct providers contributed by THIS target.
+    direct_services = [target[ComposeServiceInfo]] if ComposeServiceInfo in target else []
+    direct_image_refs = [target[ComposeServiceImageRefInfo]] if ComposeServiceImageRefInfo in target else []
+    direct_volumes = [target[ComposeVolumeInfo]] if ComposeVolumeInfo in target else []
+    direct_networks = [target[ComposeNetworkInfo]] if ComposeNetworkInfo in target else []
+    direct_configs = [target[ComposeConfigInfo]] if ComposeConfigInfo in target else []
+    direct_secrets = [target[ComposeSecretInfo]] if ComposeSecretInfo in target else []
+
+    # Direct runfiles (bind_mount sources + env_file sources) — flow up so
+    # the aggregator can stage them for `docker compose up`.
+    direct_runfiles_files = []
+    if DefaultInfo in target:
+        di = target[DefaultInfo]
+        if di.default_runfiles:
+            direct_runfiles_files.extend(di.default_runfiles.files.to_list())
+
+    # Walk every label-typed attr we propagate through. hasattr guards
+    # let the aspect apply to volume / network / config / secret rules
+    # (which don't have these attrs) without error.
+    walked = []
+    rule_attrs = ctx.rule.attr
+    if hasattr(rule_attrs, "deps"):
+        walked.extend(rule_attrs.deps)
+    if hasattr(rule_attrs, "deps_healthy"):
+        walked.extend(rule_attrs.deps_healthy)
+    if hasattr(rule_attrs, "deps_completed"):
+        walked.extend(rule_attrs.deps_completed)
+    if hasattr(rule_attrs, "networks"):
+        walked.extend(rule_attrs.networks)
+    if hasattr(rule_attrs, "configs"):
+        walked.extend(rule_attrs.configs)
+    if hasattr(rule_attrs, "secrets"):
+        walked.extend(rule_attrs.secrets)
+    if hasattr(rule_attrs, "named_volume_mounts"):
+        walked.extend(rule_attrs.named_volume_mounts.keys())
+
+    ts_services, ts_image_refs, ts_volumes, ts_networks, ts_configs, ts_secrets, ts_runfiles = _bundle_transitive(walked)
+
+    return [
+        ComposeTransitiveInfo(
+            services = depset(direct_services, transitive = ts_services),
+            image_refs = depset(direct_image_refs, transitive = ts_image_refs),
+            volumes = depset(direct_volumes, transitive = ts_volumes),
+            networks = depset(direct_networks, transitive = ts_networks),
+            configs = depset(direct_configs, transitive = ts_configs),
+            secrets = depset(direct_secrets, transitive = ts_secrets),
+            runfiles_files = depset(direct_runfiles_files, transitive = ts_runfiles),
+        ),
+    ]
+
+_compose_transitive_aspect = aspect(
+    implementation = _compose_transitive_aspect_impl,
+    attr_aspects = [
+        "deps",
+        "deps_healthy",
+        "deps_completed",
+        "networks",
+        "configs",
+        "secrets",
+        "named_volume_mounts",
+    ],
+)
 
 def _docker_compose_impl(ctx):
-    services, image_refs, volumes, networks, configs, secrets, extra_runfiles = _collect_shards(ctx.attr.deps)
+    services, image_refs, volumes, networks, configs, secrets, extra_runfiles_files = _collect_shards(ctx.attr.deps)
 
     out = ctx.outputs.out
     args = ctx.actions.args()
@@ -689,7 +797,7 @@ def _docker_compose_impl(ctx):
         progress_message = "compose-gen %s" % ctx.label.name,
     )
 
-    aggregated_runfiles = ctx.runfiles(files = [out]).merge_all(extra_runfiles)
+    aggregated_runfiles = ctx.runfiles(files = [out] + extra_runfiles_files)
     return [
         DefaultInfo(files = depset([out]), runfiles = aggregated_runfiles),
         ComposeProjectInfo(yaml = out),
@@ -712,7 +820,14 @@ docker_compose = rule(
                 [ComposeSecretInfo],
                 [ComposeServiceImageRefInfo],
             ],
-            doc = "Targets contributing services, volumes, networks, configs, secrets, or service-image overrides.",
+            aspects = [_compose_transitive_aspect],
+            doc = "Targets contributing services, volumes, networks, configs, secrets, " +
+                  "or service-image overrides. Lists ROOT services (those not depended " +
+                  "on by another listed service); the transitive aspect walks " +
+                  "`deps`/`deps_healthy`/`deps_completed`/`networks`/`configs`/`secrets`/" +
+                  "`named_volume_mounts` on each docker_compose_service to discover " +
+                  "everything else automatically. Listing extra targets is still allowed " +
+                  "(for unreferenced volumes/networks or back-compat).",
         ),
         "out": attr.output(
             mandatory = True,

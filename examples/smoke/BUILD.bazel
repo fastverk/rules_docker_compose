@@ -70,10 +70,10 @@ docker_compose_service(
 docker_compose(
     name = "stack",
     project_name = "smoke",
+    # Root services only — `_compose_transitive_aspect` walks each
+    # service's `deps`/`networks`/`named_volume_mounts` to discover the
+    # volume, network, and image-ref shards automatically.
     deps = [
-        ":appnet",
-        ":cache",
-        ":redis",
         ":web",
         ":worker",
     ],
