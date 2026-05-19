@@ -942,8 +942,28 @@ if [[ ! -f "$YAML_ABS" ]]; then
   exit 2
 fi
 
+# Compose resolves `env_file:` (and `secrets.<n>.file`, `configs.<n>.file`)
+# paths relative to the compose FILE's parent directory, NOT
+# `--project-directory`. That makes `./foo.env` written in a BUILD.bazel
+# unresolvable when the rendered yaml lives in runfiles
+# (`runfiles/_main/<pkg>/...`) — paths double-prefix. To keep workspace-
+# relative paths working, we materialize the yaml at the workspace root
+# under a hidden filename, point `-f` at that copy, and clean up on
+# exit. The yaml itself is a pure-string artifact so copying is cheap
+# (the heavyweight bits — bind-mount sources, env_files — are still
+# served from their original locations once compose resolves the path
+# relative to the workspace root).
 cd "$BUILD_WORKSPACE_DIRECTORY"
-exec docker compose -f "$YAML_ABS" {sub} {fixed} "$@"
+TMP_YAML="$BUILD_WORKSPACE_DIRECTORY/.bazel-compose.$$.yml"
+cp "$YAML_ABS" "$TMP_YAML"
+cleanup() {{ rm -f "$TMP_YAML"; }}
+trap cleanup EXIT INT TERM
+
+docker compose -f "$TMP_YAML" {sub} {fixed} "$@"
+rc=$?
+cleanup
+trap - EXIT INT TERM
+exit $rc
 """.format(
             sub = subcommand,
             ws_name = ctx.workspace_name,
