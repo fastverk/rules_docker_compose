@@ -26,19 +26,23 @@ load(
     _ComposeServiceInfo = "ComposeServiceInfo",
     _ComposeVolumeInfo = "ComposeVolumeInfo",
     _docker_compose_network = "docker_compose_network",
-    _docker_compose_service = "docker_compose_service",
+    _docker_compose_service_raw = "docker_compose_service",
     _docker_compose_volume = "docker_compose_volume",
 )
 
-# Re-export the schema-derived rules + providers as public top-level
-# symbols. Users `load("//compose:defs.bzl", "docker_compose_service")`
-# and get the codegen output via this façade.
+# Re-export the schema-derived providers + the volume/network rules
+# (these don't need a label-typed façade — their attrs are leaf scalars).
 ComposeServiceInfo = _ComposeServiceInfo
 ComposeVolumeInfo = _ComposeVolumeInfo
 ComposeNetworkInfo = _ComposeNetworkInfo
-docker_compose_service = _docker_compose_service
 docker_compose_volume = _docker_compose_volume
 docker_compose_network = _docker_compose_network
+
+# Escape hatch for advanced consumers who need the long-tail
+# compose-spec attrs (cap_add/cgroup_parent/blkio_config/etc) directly
+# as Bazel attrs rather than via the façade's `compose_extra` JSON.
+# The public `docker_compose_service` below is the canonical entrypoint.
+docker_compose_service_raw = _docker_compose_service_raw
 
 ComposeProjectInfo = provider(
     doc = "A rendered compose project.",
@@ -207,6 +211,303 @@ docker_compose_secret = rule(
         ),
     },
     provides = [ComposeSecretInfo],
+)
+
+# --- docker_compose_service (public façade) --------------------------
+#
+# Hand-written counterpart to `_docker_compose_service_raw` (the
+# schema-derived rule). Lifts the high-traffic compose-spec attrs from
+# their string form into idiomatic Bazel attrs:
+#
+#   * deps / deps_healthy / deps_completed — label_list providing
+#     ComposeServiceInfo. Compiled to the compose-spec extended
+#     `depends_on` form (object with `condition:` per service) when any
+#     conditional list is non-empty; otherwise the simple list form.
+#   * networks — label_list of docker_compose_network targets.
+#   * named_volume_mounts — label_keyed_string_dict; keys are
+#     docker_compose_volume targets, values are the in-container path
+#     (with optional `:ro`/`:rw` suffix). Compiled to compose's
+#     `volumes: ["<volume_name>:<target>"]` form.
+#   * bind_mounts — label_keyed_string_dict; keys are file/filegroup
+#     targets, values are the in-container path. Source paths resolve
+#     to `./<workspace-relative-path>` so they bind-mount cleanly under
+#     `docker compose up`. Source files contributed to the rule's
+#     runfiles so the aggregator carries them through.
+#   * configs / secrets — label_list of docker_compose_{config,secret}.
+#     Compiled to per-service `configs: [<name>]` / `secrets: [<name>]`.
+#   * env_file — label_list (`allow_files=True`); workspace-relative
+#     paths emitted into `env_file:` and source files contributed to
+#     runfiles.
+#   * image — string for tag-pinned external images. For Bazel-built
+#     OCI layouts, use a sibling `docker_compose_oci_image_ref` (or set
+#     `oci_image` here to emit one inline; see below).
+#   * oci_image — label to an OCI image layout. When set, the façade
+#     emits a sibling ComposeServiceImageRefInfo provider so the
+#     aggregator threads the build-time-resolved `<repo>@<digest>` into
+#     the rendered `image:` field. Either `image` (string) or
+#     `oci_image` (label) must be set; not both.
+#   * compose_extra — JSON-encoded dict of any compose-spec attrs not
+#     hoisted into the façade (cpu_count, mem_limit, deploy, ...).
+#     Merged into the emitted shard verbatim.
+#
+# Long-tail consumers can still call `docker_compose_service_raw`
+# directly for full attr coverage.
+
+_CONDITION_STARTED = "service_started"
+_CONDITION_HEALTHY = "service_healthy"
+_CONDITION_COMPLETED = "service_completed_successfully"
+
+def _compile_depends_on(deps, deps_healthy, deps_completed):
+    """Render `depends_on` in the simple list form when no conditional
+    deps are present, else the extended object form. Compose accepts
+    both; the simple form reads cleaner."""
+    simple = [d[ComposeServiceInfo].service_name for d in deps]
+    healthy = [d[ComposeServiceInfo].service_name for d in deps_healthy]
+    completed = [d[ComposeServiceInfo].service_name for d in deps_completed]
+    if not (simple or healthy or completed):
+        return None
+    if not (healthy or completed):
+        return simple
+    out = {}
+    for n in simple:
+        out[n] = {"condition": _CONDITION_STARTED}
+    for n in healthy:
+        out[n] = {"condition": _CONDITION_HEALTHY}
+    for n in completed:
+        out[n] = {"condition": _CONDITION_COMPLETED}
+    return out
+
+def _compile_volumes(named_volume_mounts, bind_mounts):
+    """Combine named-volume mounts + bind-mounts into the single
+    compose-spec `volumes:` list form (`"src:target[:mode]"`)."""
+    out = []
+    for vol_target, mount in named_volume_mounts.items():
+        vol_name = vol_target[ComposeVolumeInfo].volume_name
+        out.append("{}:{}".format(vol_name, mount))
+    for src_target, mount in bind_mounts.items():
+        files = src_target[DefaultInfo].files.to_list()
+        if not files:
+            fail("bind_mount source {} has no files".format(src_target.label))
+        if len(files) > 1:
+            fail("bind_mount source {} resolves to {} files; expected exactly 1".format(
+                src_target.label,
+                len(files),
+            ))
+        src_path = "./" + files[0].short_path
+        out.append("{}:{}".format(src_path, mount))
+    return out
+
+def _docker_compose_service_impl(ctx):
+    if ctx.attr.image and ctx.attr.oci_image:
+        fail("{}: docker_compose_service.image (string) and .oci_image (label) are mutually exclusive.".format(ctx.label))
+    if not ctx.attr.image and not ctx.attr.oci_image:
+        fail("{}: docker_compose_service requires either `image` (string) or `oci_image` (label).".format(ctx.label))
+
+    item_name = ctx.attr.service_name or ctx.label.name
+
+    # Long-tail compose-spec attrs flow through `compose_extra` (JSON dict).
+    extra = json.decode(ctx.attr.compose_extra) if ctx.attr.compose_extra else {}
+
+    # Hot-path payload — only non-empty fields end up in the shard
+    # (typify/serde's `skip_serializing_if = Option::is_none` handles
+    # the rest in the Rust binary).
+    payload = {
+        "image": ctx.attr.image if ctx.attr.image else "",  # placeholder; oci_image override applies via image-ref shard
+        "command": ctx.attr.command,
+        "entrypoint": ctx.attr.entrypoint,
+        "environment": ctx.attr.environment,
+        "env_file": ["./" + f.short_path for f in ctx.files.env_file],
+        "ports": ctx.attr.ports,
+        "restart": ctx.attr.restart,
+        "user": ctx.attr.user,
+        "working_dir": ctx.attr.working_dir,
+        "container_name": ctx.attr.container_name,
+        "hostname": ctx.attr.hostname,
+        "healthcheck": json.decode(ctx.attr.healthcheck) if ctx.attr.healthcheck else None,
+        "networks": [d[ComposeNetworkInfo].network_name for d in ctx.attr.networks],
+        "depends_on": _compile_depends_on(ctx.attr.deps, ctx.attr.deps_healthy, ctx.attr.deps_completed),
+        "volumes": _compile_volumes(ctx.attr.named_volume_mounts, ctx.attr.bind_mounts),
+        "configs": [c[ComposeConfigInfo].config_name for c in ctx.attr.configs],
+        "secrets": [s[ComposeSecretInfo].secret_name for s in ctx.attr.secrets],
+        "profiles": ctx.attr.profiles,
+        "privileged": ctx.attr.privileged if ctx.attr.privileged else None,
+        "init": ctx.attr.init if ctx.attr.init else None,
+        "stdin_open": ctx.attr.stdin_open if ctx.attr.stdin_open else None,
+        "tty": ctx.attr.tty if ctx.attr.tty else None,
+    }
+    # Merge compose_extra over the hot-path payload (extra wins on collision).
+    payload.update(extra)
+    # Drop empty values; the typify-generated Service struct uses
+    # `#[serde(skip_serializing_if = "Option::is_none")]` and a present
+    # empty list emits a sequence rather than getting elided.
+    payload = {
+        k: v
+        for k, v in payload.items()
+        if v != None and v != [] and v != {} and v != ""
+    }
+
+    shard = ctx.actions.declare_file("{}.service.json".format(ctx.label.name))
+    ctx.actions.write(shard, content = json.encode(payload))
+
+    providers = [
+        ComposeServiceInfo(service_name = item_name, json = shard),
+    ]
+
+    # Collect runfiles from bind_mounts + env_file so the aggregator's
+    # `_compose_runner` can find every source path the rendered yaml
+    # references at `docker compose up` time.
+    rf_files = list(ctx.files.env_file)
+    for src_target in ctx.attr.bind_mounts:
+        rf_files.extend(src_target[DefaultInfo].files.to_list())
+    runfiles = ctx.runfiles(files = rf_files)
+
+    # Optional oci_image: emit an inline image-ref shard. Reuses the
+    # exact mechanism docker_compose_oci_image_ref uses so the
+    # aggregator's `--service-image` flag handles it the same way.
+    if ctx.attr.oci_image:
+        ref_out = ctx.actions.declare_file("{}.image-ref.txt".format(ctx.label.name))
+        layout_files = ctx.attr.oci_image[DefaultInfo].files.to_list()
+        if not layout_files:
+            fail("{}: oci_image target {} has no files".format(ctx.label, ctx.attr.oci_image.label))
+        ctx.actions.run(
+            outputs = [ref_out],
+            inputs = layout_files,
+            executable = ctx.executable._compose_gen,
+            arguments = [
+                "image-ref",
+                "--layout",
+                layout_files[0].path,
+                "--repo",
+                ctx.attr.oci_repo,
+                "--out",
+                ref_out.path,
+            ],
+            mnemonic = "ComposeImageRef",
+            progress_message = "compose-gen image-ref %s" % ctx.label,
+        )
+        providers.append(ComposeServiceImageRefInfo(
+            service_name = item_name,
+            file = ref_out,
+        ))
+        # The aggregator picks up the image-ref via providers, not via
+        # the shard files set. Don't add ref_out to DefaultInfo.files.
+
+    providers.append(DefaultInfo(
+        files = depset([shard]),
+        runfiles = runfiles,
+    ))
+    return providers
+
+docker_compose_service = rule(
+    implementation = _docker_compose_service_impl,
+    doc = "Idiomatic, label-typed compose service. Most consumers use this; for the long tail " +
+          "of compose-spec attrs, see `docker_compose_service_raw`.",
+    attrs = {
+        "service_name": attr.string(
+            doc = "Override the compose-rendered service key. Defaults to target name.",
+        ),
+
+        # ── Image ─────────────────────────────────────────────────────
+        "image": attr.string(
+            doc = "Tag-pinned image reference (e.g. `nginx:1.27`). Mutually exclusive with `oci_image`.",
+        ),
+        "oci_image": attr.label(
+            allow_files = True,
+            doc = "OCI image layout label (e.g. `@caddy` or `//path:image`). At build time, the " +
+                  "façade resolves `<repo>@sha256:<digest>` from the layout and threads it into " +
+                  "the rendered `image:` via a sibling ComposeServiceImageRefInfo provider.",
+        ),
+        "oci_repo": attr.string(
+            doc = "Registry/repo prefix to combine with the resolved digest. Required when " +
+                  "`oci_image` is set.",
+        ),
+
+        # ── Command + lifecycle ────────────────────────────────────────
+        "command": attr.string_list(),
+        "entrypoint": attr.string_list(),
+        "user": attr.string(),
+        "working_dir": attr.string(),
+        "container_name": attr.string(),
+        "hostname": attr.string(),
+        "restart": attr.string(),
+        "init": attr.bool(),
+        "stdin_open": attr.bool(),
+        "tty": attr.bool(),
+        "privileged": attr.bool(),
+
+        # ── Env ───────────────────────────────────────────────────────
+        "environment": attr.string_dict(),
+        "env_file": attr.label_list(
+            allow_files = True,
+            doc = "Files whose lines are merged into the service environment. Source files " +
+                  "are added to runfiles for `docker compose up`.",
+        ),
+
+        # ── Network ───────────────────────────────────────────────────
+        "ports": attr.string_list(),
+        "networks": attr.label_list(
+            providers = [ComposeNetworkInfo],
+        ),
+
+        # ── Dependencies (by condition) ───────────────────────────────
+        "deps": attr.label_list(
+            providers = [ComposeServiceInfo],
+            doc = "Services that must start before this one (compose `service_started` condition).",
+        ),
+        "deps_healthy": attr.label_list(
+            providers = [ComposeServiceInfo],
+            doc = "Services that must be healthy before this one starts (compose `service_healthy`).",
+        ),
+        "deps_completed": attr.label_list(
+            providers = [ComposeServiceInfo],
+            doc = "Services that must exit successfully before this one starts " +
+                  "(compose `service_completed_successfully`).",
+        ),
+
+        # ── Mounts ────────────────────────────────────────────────────
+        "named_volume_mounts": attr.label_keyed_string_dict(
+            providers = [ComposeVolumeInfo],
+            doc = "Map of docker_compose_volume targets to in-container mount paths. " +
+                  "Value may include a `:ro`/`:rw` suffix.",
+        ),
+        "bind_mounts": attr.label_keyed_string_dict(
+            allow_files = True,
+            doc = "Map of file/filegroup targets to in-container mount paths. The source path " +
+                  "renders as `./<workspace-relative>` so it resolves at `docker compose up` time. " +
+                  "Value may include a `:ro`/`:rw` suffix.",
+        ),
+
+        # ── Configs + Secrets ─────────────────────────────────────────
+        "configs": attr.label_list(
+            providers = [ComposeConfigInfo],
+            doc = "docker_compose_config targets referenced by this service.",
+        ),
+        "secrets": attr.label_list(
+            providers = [ComposeSecretInfo],
+            doc = "docker_compose_secret targets referenced by this service.",
+        ),
+
+        # ── Misc ──────────────────────────────────────────────────────
+        "profiles": attr.string_list(
+            doc = "Compose profiles this service belongs to.",
+        ),
+        "healthcheck": attr.string(
+            doc = "JSON-encoded healthcheck dict (test, interval, retries, etc).",
+        ),
+        "compose_extra": attr.string(
+            doc = "JSON-encoded dict of long-tail compose-spec attrs not hoisted into the façade " +
+                  "(cpu_count, mem_limit, blkio_config, deploy, ...). Merged over the hot-path " +
+                  "payload; `compose_extra` wins on collision.",
+        ),
+
+        # ── Internal ──────────────────────────────────────────────────
+        "_compose_gen": attr.label(
+            default = Label("//compose/private/compose_gen:compose_gen"),
+            executable = True,
+            cfg = "exec",
+        ),
+    },
+    provides = [ComposeServiceInfo],
 )
 
 # --- docker_compose_oci_image_ref -----------------------------------

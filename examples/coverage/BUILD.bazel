@@ -3,15 +3,17 @@ load(
     "@rules_docker_compose//compose:defs.bzl",
     "docker_compose",
     "docker_compose_network",
-    "docker_compose_service",
+    "docker_compose_service_raw",
     "docker_compose_volume",
 )
 
-# Exercises rule attrs the smoke example doesn't touch. Post-v0.2
-# everything compose-spec accepts is reachable through the typed
-# rules — `build`, `healthcheck`, `deploy` and similar nested objects
-# are JSON-encoded string attrs (the Rust shard reader parses them
-# into typify-generated structs).
+# Exercises the schema-derived raw rule's long-tail attrs (build, labels,
+# shm_size, stop_grace_period, cap_add, sysctls, …) that aren't lifted
+# into the v0.2 public façade. Consumers needing these reach for
+# `docker_compose_service_raw`; the façade `docker_compose_service`
+# covers the high-traffic 80% of services without exposing the full
+# 95-attr schema-derived surface.
+docker_compose_service = docker_compose_service_raw
 
 docker_compose_network(
     name = "internal",
