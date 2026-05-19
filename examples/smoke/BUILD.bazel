@@ -2,8 +2,11 @@ load("@bazel_skylib//rules:diff_test.bzl", "diff_test")
 load(
     "@rules_docker_compose//compose:defs.bzl",
     "docker_compose",
+    "docker_compose_command",
     "docker_compose_down",
+    "docker_compose_exec",
     "docker_compose_network",
+    "docker_compose_run",
     "docker_compose_service",
     "docker_compose_up",
     "docker_compose_volume",
@@ -88,6 +91,32 @@ docker_compose_up(
 docker_compose_down(
     name = "stack.down",
     project = ":stack",
+)
+
+# `bazel run :redis.shell` -> docker compose -f <yml> exec -T redis redis-cli
+docker_compose_exec(
+    name = "redis.shell",
+    project = ":stack",
+    service = "redis",
+    command = ["redis-cli"],
+    no_tty = True,
+)
+
+# `bazel run :worker.once -- --extra-arg` -> docker compose -f <yml> run --rm
+# worker echo "smoke run" --extra-arg
+docker_compose_run(
+    name = "worker.once",
+    project = ":stack",
+    service = "worker",
+    command = ["echo", "smoke run"],
+)
+
+# `bazel run :stack.logs -- redis` -> docker compose -f <yml> logs -f redis
+docker_compose_command(
+    name = "stack.logs",
+    project = ":stack",
+    subcommand = "logs",
+    args = ["-f"],
 )
 
 # Pins the entire end-to-end output. Refresh the committed

@@ -888,9 +888,23 @@ docker_compose = rule(
 
 # --- bazel run wrappers ----------------------------------------------
 
+def _shell_quote(s):
+    """Bash single-quote `s`, escaping any internal single quote."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
 def _compose_runner_impl(ctx):
     yaml_file = ctx.attr.project[ComposeProjectInfo].yaml
     subcommand = ctx.attr.subcommand
+
+    # Fixed args sit between SUBCOMMAND and "$@" on the docker-compose
+    # invocation. Composed as:
+    #   <flag_args> [<service>] [<command...>]
+    # Each arg is shell-single-quoted so embedded spaces / quotes work.
+    fixed_args = list(ctx.attr.flag_args)
+    if ctx.attr.service:
+        fixed_args.append(ctx.attr.service)
+    fixed_args.extend(ctx.attr.command)
+    quoted_fixed_args = " ".join([_shell_quote(a) for a in fixed_args])
 
     # Bind-mount paths in compose files resolve relative to the YAML
     # file's directory, so for `./data:/data` to mean the user's
@@ -929,11 +943,12 @@ if [[ ! -f "$YAML_ABS" ]]; then
 fi
 
 cd "$BUILD_WORKSPACE_DIRECTORY"
-exec docker compose -f "$YAML_ABS" {sub} "$@"
+exec docker compose -f "$YAML_ABS" {sub} {fixed} "$@"
 """.format(
             sub = subcommand,
             ws_name = ctx.workspace_name,
             yaml_sp = yaml_file.short_path,
+            fixed = quoted_fixed_args,
         ),
     )
 
@@ -955,6 +970,20 @@ _compose_runner = rule(
             doc = "A `docker_compose` target whose generated yaml to invoke.",
         ),
         "subcommand": attr.string(mandatory = True, doc = "docker compose subcommand."),
+        "flag_args": attr.string_list(
+            default = [],
+            doc = "Flag args between the subcommand and `<service>`/`<command>` " +
+                  "(e.g. `[\"--rm\", \"-T\"]`).",
+        ),
+        "service": attr.string(
+            default = "",
+            doc = "Optional service name for subcommands that target one " +
+                  "(exec, run, logs <svc>, restart <svc>, ...).",
+        ),
+        "command": attr.string_list(
+            default = [],
+            doc = "Command + args to run inside the container (for exec / run).",
+        ),
     },
 )
 
@@ -977,5 +1006,174 @@ def docker_compose_down(name, project, **kwargs):
         name = name,
         project = project,
         subcommand = "down",
+        **kwargs
+    )
+
+# ─── docker_compose_exec ─────────────────────────────────────────────
+#
+# `bazel run :<name>` -> `docker compose -f <yaml> exec [flags] <service> <cmd...>`.
+# Fail-loud if the service isn't running (docker compose's own error
+# surfaces clearly; no auto-up).
+
+def docker_compose_exec(
+        name,
+        project,
+        service,
+        command = [],
+        user = "",
+        workdir = "",
+        env = {},
+        detach = False,
+        no_tty = False,
+        privileged = False,
+        index = 0,
+        **kwargs):
+    """Name a `docker compose exec` invocation as a Bazel target.
+
+    Args:
+      name: Bazel target name. `bazel run :<name>` triggers the exec.
+      project: `docker_compose` target whose rendered yaml to use.
+      service: name of the service to exec into.
+      command: list of strings — the program + args to run in-container.
+      user: pass through as `--user <user>` (empty = service default).
+      workdir: pass through as `--workdir <dir>`.
+      env: dict of `KEY: VALUE` — each becomes `--env KEY=VALUE`.
+      detach: if True, pass `--detach` (the exec returns immediately).
+      no_tty: if True, pass `-T` (disable TTY allocation; needed for
+              non-interactive use, e.g. CI).
+      privileged: if True, pass `--privileged`.
+      index: 1-based container index if the service has replicas; ignored
+             when 0 (the default).
+      **kwargs: forwarded to the underlying `_compose_runner` rule
+                (visibility, tags, etc).
+    """
+    flag_args = []
+    if user:
+        flag_args.extend(["--user", user])
+    if workdir:
+        flag_args.extend(["--workdir", workdir])
+    for k in sorted(env.keys()):
+        flag_args.extend(["--env", "{}={}".format(k, env[k])])
+    if detach:
+        flag_args.append("--detach")
+    if no_tty:
+        flag_args.append("-T")
+    if privileged:
+        flag_args.append("--privileged")
+    if index > 0:
+        flag_args.extend(["--index", str(index)])
+    _compose_runner(
+        name = name,
+        project = project,
+        subcommand = "exec",
+        flag_args = flag_args,
+        service = service,
+        command = command,
+        **kwargs
+    )
+
+# ─── docker_compose_run ──────────────────────────────────────────────
+#
+# `bazel run :<name>` -> `docker compose -f <yaml> run [flags] <service> <cmd...>`.
+# Spawns a one-off container based on the service definition. Default
+# is `--rm` so the container is cleaned up on exit.
+
+def docker_compose_run(
+        name,
+        project,
+        service,
+        command = [],
+        user = "",
+        workdir = "",
+        env = {},
+        rm = True,
+        detach = False,
+        no_tty = False,
+        service_ports = False,
+        use_aliases = False,
+        no_deps = False,
+        name_override = "",
+        **kwargs):
+    """Name a `docker compose run` invocation as a Bazel target.
+
+    Args:
+      name: Bazel target name.
+      project: `docker_compose` target whose rendered yaml to use.
+      service: service definition to base the one-off container on.
+      command: command + args to run; if empty, uses the service's
+               default entrypoint+command.
+      user / workdir / env: as for `docker_compose_exec`.
+      rm: if True (default), pass `--rm`.
+      detach: if True, pass `--detach`.
+      no_tty: if True, pass `-T`.
+      service_ports: if True, publish the service's `ports:` block.
+      use_aliases: if True, use the service's network aliases.
+      no_deps: if True, don't start linked services.
+      name_override: if non-empty, pass `--name <name>` to the container.
+      **kwargs: forwarded to the underlying rule.
+    """
+    flag_args = []
+    if rm:
+        flag_args.append("--rm")
+    if user:
+        flag_args.extend(["--user", user])
+    if workdir:
+        flag_args.extend(["--workdir", workdir])
+    for k in sorted(env.keys()):
+        flag_args.extend(["--env", "{}={}".format(k, env[k])])
+    if detach:
+        flag_args.append("--detach")
+    if no_tty:
+        flag_args.append("-T")
+    if service_ports:
+        flag_args.append("--service-ports")
+    if use_aliases:
+        flag_args.append("--use-aliases")
+    if no_deps:
+        flag_args.append("--no-deps")
+    if name_override:
+        flag_args.extend(["--name", name_override])
+    _compose_runner(
+        name = name,
+        project = project,
+        subcommand = "run",
+        flag_args = flag_args,
+        service = service,
+        command = command,
+        **kwargs
+    )
+
+# ─── docker_compose_command ──────────────────────────────────────────
+#
+# Generic escape hatch for the long tail of `docker compose <sub>`
+# verbs we don't have a typed wrapper for (logs, ps, restart, cp, top,
+# events, port, images, version, …). Fixed args after the subcommand
+# can be supplied via `args`; anything after `--` on the bazel run
+# command line is appended verbatim.
+
+def docker_compose_command(
+        name,
+        project,
+        subcommand,
+        args = [],
+        service = "",
+        **kwargs):
+    """`bazel run :<name>` -> `docker compose -f <yaml> <subcommand> <args> [service] [extra...]`.
+
+    Args:
+      name: Bazel target name.
+      project: `docker_compose` target whose rendered yaml to use.
+      subcommand: e.g. `"logs"`, `"ps"`, `"restart"`, `"cp"`.
+      args: list of strings, threaded between the subcommand and the
+            optional `service` token.
+      service: optional service name appended after `args`.
+      **kwargs: forwarded to the underlying rule.
+    """
+    _compose_runner(
+        name = name,
+        project = project,
+        subcommand = subcommand,
+        flag_args = args,
+        service = service,
         **kwargs
     )
