@@ -110,7 +110,7 @@ def _docker_compose_config_impl(ctx):
     src_file = ctx.file.src
 
     payload = _strip_empty({
-        "file": "./" + src_file.short_path if src_file else None,
+        "file": "${WORKSPACE_DIR}/" + src_file.short_path if src_file else None,
         "external": ctx.attr.external if ctx.attr.external else None,
         "name": ctx.attr.name_override,
         "template_driver": ctx.attr.template_driver,
@@ -171,7 +171,7 @@ def _docker_compose_secret_impl(ctx):
         fail("{}: docker_compose_secret cannot have both `src` and `environment`.".format(ctx.label))
 
     payload = _strip_empty({
-        "file": "./" + src_file.short_path if src_file else None,
+        "file": "${WORKSPACE_DIR}/" + src_file.short_path if src_file else None,
         "environment": ctx.attr.environment,
         "external": ctx.attr.external if ctx.attr.external else None,
         "name": ctx.attr.name_override,
@@ -310,7 +310,7 @@ def _compile_volumes(named_volume_mounts, bind_mounts):
                 src_target.label,
                 len(files),
             ))
-        src_path = "./" + files[0].short_path
+        src_path = "${WORKSPACE_DIR}/" + files[0].short_path
         out.append("{}:{}".format(src_path, mount))
     return out
 
@@ -338,7 +338,7 @@ def _docker_compose_service_impl(ctx):
         "command": ctx.attr.command,
         "entrypoint": ctx.attr.entrypoint,
         "environment": ctx.attr.environment,
-        "env_file": ["./" + f.short_path for f in ctx.files.env_file],
+        "env_file": ["${WORKSPACE_DIR}/" + f.short_path for f in ctx.files.env_file],
         "ports": ctx.attr.ports,
         "restart": ctx.attr.restart,
         "user": ctx.attr.user,
@@ -942,28 +942,17 @@ if [[ ! -f "$YAML_ABS" ]]; then
   exit 2
 fi
 
-# Compose resolves `env_file:` (and `secrets.<n>.file`, `configs.<n>.file`)
-# paths relative to the compose FILE's parent directory, NOT
-# `--project-directory`. That makes `./foo.env` written in a BUILD.bazel
-# unresolvable when the rendered yaml lives in runfiles
-# (`runfiles/_main/<pkg>/...`) — paths double-prefix. To keep workspace-
-# relative paths working, we materialize the yaml at the workspace root
-# under a hidden filename, point `-f` at that copy, and clean up on
-# exit. The yaml itself is a pure-string artifact so copying is cheap
-# (the heavyweight bits — bind-mount sources, env_files — are still
-# served from their original locations once compose resolves the path
-# relative to the workspace root).
+# Compose resolves `env_file:` / `configs.<n>.file` / `secrets.<n>.file`
+# paths relative to the compose FILE's parent dir (NOT `--project-directory`).
+# That makes `./foo` written in a BUILD.bazel unresolvable when the yaml
+# lives in runfiles. Rather than relocate the yaml at runtime, the
+# façade emits those paths as `${{WORKSPACE_DIR}}/<short_path>` — compose
+# v2 interpolates `${{VAR}}` from the parent process's env BEFORE
+# resolving paths, so the final path is absolute and cwd-independent.
+# Export WORKSPACE_DIR here so that substitution lands.
+export WORKSPACE_DIR="$BUILD_WORKSPACE_DIRECTORY"
 cd "$BUILD_WORKSPACE_DIRECTORY"
-TMP_YAML="$BUILD_WORKSPACE_DIRECTORY/.bazel-compose.$$.yml"
-cp "$YAML_ABS" "$TMP_YAML"
-cleanup() {{ rm -f "$TMP_YAML"; }}
-trap cleanup EXIT INT TERM
-
-docker compose -f "$TMP_YAML" {sub} {fixed} "$@"
-rc=$?
-cleanup
-trap - EXIT INT TERM
-exit $rc
+exec docker compose -f "$YAML_ABS" {sub} {fixed} "$@"
 """.format(
             sub = subcommand,
             ws_name = ctx.workspace_name,

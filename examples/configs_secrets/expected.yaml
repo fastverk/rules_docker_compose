@@ -1,13 +1,13 @@
 configs:
   prometheus:
-    file: ./examples/configs_secrets/prometheus.yml
+    file: ${WORKSPACE_DIR}/examples/configs_secrets/prometheus.yml
 name: configs_secrets
 networks:
   appnet:
     driver: bridge
 secrets:
   api_key:
-    file: ./examples/configs_secrets/api_key.txt
+    file: ${WORKSPACE_DIR}/examples/configs_secrets/api_key.txt
   session_key:
     environment: SESSION_KEY
 services:
