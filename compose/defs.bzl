@@ -349,8 +349,20 @@ def _docker_compose_service_impl(ctx):
         "networks": [d[ComposeNetworkInfo].network_name for d in ctx.attr.networks],
         "depends_on": _compile_depends_on(ctx.attr.deps, ctx.attr.deps_healthy, ctx.attr.deps_completed),
         "volumes": _compile_volumes(ctx.attr.named_volume_mounts, ctx.attr.bind_mounts),
-        "configs": [c[ComposeConfigInfo].config_name for c in ctx.attr.configs],
-        "secrets": [s[ComposeSecretInfo].secret_name for s in ctx.attr.secrets],
+        "configs": (
+            [c[ComposeConfigInfo].config_name for c in ctx.attr.configs] +
+            [
+                {"source": cfg[ComposeConfigInfo].config_name, "target": target}
+                for cfg, target in ctx.attr.config_mounts.items()
+            ]
+        ),
+        "secrets": (
+            [s[ComposeSecretInfo].secret_name for s in ctx.attr.secrets] +
+            [
+                {"source": sec[ComposeSecretInfo].secret_name, "target": target}
+                for sec, target in ctx.attr.secret_mounts.items()
+            ]
+        ),
         "profiles": ctx.attr.profiles,
         "privileged": ctx.attr.privileged if ctx.attr.privileged else None,
         "init": ctx.attr.init if ctx.attr.init else None,
@@ -511,11 +523,23 @@ docker_compose_service = rule(
         # ── Configs + Secrets ─────────────────────────────────────────
         "configs": attr.label_list(
             providers = [ComposeConfigInfo],
-            doc = "docker_compose_config targets referenced by this service.",
+            doc = "docker_compose_config targets referenced by this service. Mounted at " +
+                  "the compose-default path (`/<config_name>`). Use `config_mounts` for a " +
+                  "specific target path.",
+        ),
+        "config_mounts": attr.label_keyed_string_dict(
+            providers = [ComposeConfigInfo],
+            doc = "Map of docker_compose_config targets to in-container mount paths. " +
+                  "Emits the compose-spec extended `configs: [{source, target}]` form.",
         ),
         "secrets": attr.label_list(
             providers = [ComposeSecretInfo],
-            doc = "docker_compose_secret targets referenced by this service.",
+            doc = "docker_compose_secret targets referenced by this service. Mounted at " +
+                  "`/run/secrets/<secret_name>`. Use `secret_mounts` to override.",
+        ),
+        "secret_mounts": attr.label_keyed_string_dict(
+            providers = [ComposeSecretInfo],
+            doc = "Map of docker_compose_secret targets to in-container mount paths.",
         ),
 
         # ── Misc ──────────────────────────────────────────────────────
@@ -739,6 +763,10 @@ def _compose_transitive_aspect_impl(target, ctx):
         walked.extend(rule_attrs.secrets)
     if hasattr(rule_attrs, "named_volume_mounts"):
         walked.extend(rule_attrs.named_volume_mounts.keys())
+    if hasattr(rule_attrs, "config_mounts"):
+        walked.extend(rule_attrs.config_mounts.keys())
+    if hasattr(rule_attrs, "secret_mounts"):
+        walked.extend(rule_attrs.secret_mounts.keys())
 
     ts_services, ts_image_refs, ts_volumes, ts_networks, ts_configs, ts_secrets, ts_runfiles = _bundle_transitive(walked)
 
@@ -762,7 +790,9 @@ _compose_transitive_aspect = aspect(
         "deps_completed",
         "networks",
         "configs",
+        "config_mounts",
         "secrets",
+        "secret_mounts",
         "named_volume_mounts",
     ],
 )
