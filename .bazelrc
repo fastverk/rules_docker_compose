@@ -1,9 +1,0 @@
-common --enable_bzlmod
-
-# Personal Bazel module registry (fastverk org) — listed first so it
-# wins over BCR for our own modules.
-common --registry=https://raw.githubusercontent.com/fastverk/bazel-registry/main/
-common --registry=https://bcr.bazel.build/
-
-test --test_output=errors
-test --test_summary=terse
